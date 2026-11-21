@@ -10,7 +10,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install PyInstaller
-        run: pip install pyinstaller
+        run: pip install pyinstaller pycryptodome
       - name: Download ffmpeg
         shell: pwsh
         run: |
@@ -24,8 +24,8 @@ jobs:
       - name: Zip package
         shell: pwsh
         run: |
-          Compress-Archive -Path dist\AiyeDownloader -DestinationPath AiyeDownloader_Windows_X64_v1.0.1.zip
+          Compress-Archive -Path dist\AiyeDownloader -DestinationPath AiyeDownloader_Windows_X64_v1.0.2.zip
       - uses: actions/upload-artifact@v4
         with:
-          name: AiyeDownloader_Windows_X64_v1.0.1
-          path: AiyeDownloader_Windows_X64_v1.0.1.zip
+          name: AiyeDownloader_Windows_X64_v1.0.2
+          path: AiyeDownloader_Windows_X64_v1.0.2.zip
