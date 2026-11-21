@@ -19,7 +19,7 @@ import time
 import urllib.parse
 import urllib.request
 
-VERSION = "v1.0.5"
+VERSION = "v1.0.6"
 APP_NAME = "爱液下载器"
 
 FALLBACK_HOSTS = [
@@ -637,6 +637,26 @@ def run_gui():
     root.bind_all("<Return>", lambda e: do_search())
     ent.focus_set()
 
+    # 输入框右键菜单：剪切/复制/粘贴/全选（纯鼠标也能粘贴）
+    def add_edit_menu(widget):
+        menu = tk.Menu(widget, tearoff=0)
+        menu.add_command(label="剪切", command=lambda: widget.event_generate("<<Cut>>"))
+        menu.add_command(label="复制", command=lambda: widget.event_generate("<<Copy>>"))
+        menu.add_command(label="粘贴", command=lambda: widget.event_generate("<<Paste>>"))
+        menu.add_separator()
+        menu.add_command(label="全选", command=lambda: (widget.select_range(0, "end"), widget.icursor("end")))
+
+        def show(ev):
+            widget.focus_set()
+            try:
+                menu.tk_popup(ev.x_root, ev.y_root)
+            finally:
+                menu.grab_release()
+
+        widget.bind("<Button-3>", show)
+
+    add_edit_menu(ent)
+
     # 中部：搜索结果列表（占满）
     mid = tk.Frame(root)
     mid.pack(fill="both", expand=True, padx=10, pady=4)
@@ -668,7 +688,9 @@ def run_gui():
     bot = tk.Frame(root)
     bot.pack(fill="x", padx=10, pady=(0, 6))
     tk.Label(bot, text="存到：").pack(side="left")
-    tk.Entry(bot, textvariable=dir_var, width=52).pack(side="left", padx=(0, 6))
+    dir_entry = tk.Entry(bot, textvariable=dir_var, width=52)
+    dir_entry.pack(side="left", padx=(0, 6))
+    add_edit_menu(dir_entry)
 
     def choose_dir():
         d = filedialog.askdirectory(initialdir=dir_var.get())
@@ -736,28 +758,55 @@ def run_gui():
                     os.makedirs(out_dir, exist_ok=True)
                 except Exception:
                     pass
-                state["stop"].clear()
                 state["cur_title"] = e["item"].get("title") or "视频"
-                last_pct = [-1]
+                attempt = 0
+                while True:
+                    attempt += 1
+                    if attempt == 1:
+                        state["stop"].clear()
+                    last_pct = [-1]
 
-                def cb(pct, mb, e=e, last_pct=last_pct):
-                    q.put(("progress", (pct, mb)))
-                    if pct is not None and pct // 10 != last_pct[0] // 10:
-                        last_pct[0] = pct
-                        e["status"] = "下载中 %d%%" % pct
+                    def cb(pct, mb, e=e, last_pct=last_pct):
+                        q.put(("progress", (pct, mb)))
+                        if pct is not None and pct // 10 != last_pct[0] // 10:
+                            last_pct[0] = pct
+                            e["status"] = "下载中 %d%%" % pct
+                            q.put(("queue", None))
+
+                    try:
+                        download_mp4(
+                            state["api"], e["item"], out_dir,
+                            progress_cb=cb,
+                            stop_flag=state["stop"],
+                            log=lambda m: q.put(("status", m)),
+                        )
+                        e["status"] = "已完成"
+                        break
+                    except Exception as ex:
+                        msg = str(ex)
+                        if msg == "已停止":
+                            e["status"] = "已停止"
+                            break
+                        if "没拿到播放地址" in msg or attempt >= 3:
+                            e["status"] = "失败：" + msg[:50]
+                            break
+                        # 失败自动重试：等 5 秒重新拿新地址再下，最多 3 次
+                        e["status"] = "失败，5 秒后自动重试（第 %d 次）" % (attempt + 1)
                         q.put(("queue", None))
-
-                try:
-                    download_mp4(
-                        state["api"], e["item"], out_dir,
-                        progress_cb=cb,
-                        stop_flag=state["stop"],
-                        log=lambda m: q.put(("status", m)),
-                    )
-                    e["status"] = "已完成"
-                except Exception as ex:
-                    msg = str(ex)
-                    e["status"] = "已停止" if msg == "已停止" else ("失败：" + msg[:50])
+                        q.put(("status", "下载失败，自动重试：%s" % (e["item"].get("title") or "无标题")))
+                        stopped = False
+                        waited = 0.0
+                        while waited < 5:
+                            if state["stop"].is_set():
+                                stopped = True
+                                break
+                            time.sleep(0.2)
+                            waited += 0.2
+                        if stopped:
+                            e["status"] = "已停止"
+                            break
+                        e["status"] = "下载中"
+                        q.put(("queue", None))
                 q.put(("queue", None))
                 q.put(("progress", (0, 0)))
         finally:
