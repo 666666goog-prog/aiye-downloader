@@ -19,7 +19,7 @@ import time
 import urllib.parse
 import urllib.request
 
-VERSION = "v1.0.4"
+VERSION = "v1.0.5"
 APP_NAME = "爱液下载器"
 
 FALLBACK_HOSTS = [
@@ -185,7 +185,7 @@ def _fetch_bytes(url, timeout=30, retries=3):
     raise last
 
 
-def _fetch_full(url, timeout=45, max_rounds=12):
+def _fetch_full(url, timeout=20, max_rounds=8):
     """带断点续传的下载：这个分片服务器经常下到一半断线，
     断了就用 Range 从断点接着下，已下的字节不浪费。"""
     buf = bytearray()
@@ -302,7 +302,7 @@ def _download_hls_parallel(m3u8_url, out_path, progress_cb=None, stop_flag=None)
             raise RuntimeError("已停止")
         complete = True
         try:
-            data = _fetch_full(url, timeout=45)
+            data = _fetch_full(url, timeout=20)
         except _Incomplete as e:
             # 个别分片在服务器上本身就是残的：用下到的部分顶上，
             # 播放时那几秒可能有点花，但整片能下完，不整单报废。
@@ -330,11 +330,32 @@ def _download_hls_parallel(m3u8_url, out_path, progress_cb=None, stop_flag=None)
                 progress_cb(min(99, int(counter["n"] * 100 / total)),
                             counter["bytes"] / 1048576.0)
 
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=8)
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
-            futs = [ex.submit(one, i, u) for i, u in enumerate(segs)]
-            for fu in concurrent.futures.as_completed(futs):
+        futs = [ex.submit(one, i, u) for i, u in enumerate(segs)]
+        pending = set(futs)
+        last_progress = time.time()
+        last_n = 0
+        while pending:
+            finished, pending = concurrent.futures.wait(
+                pending, timeout=5,
+                return_when=concurrent.futures.FIRST_COMPLETED)
+            for fu in finished:
                 fu.result()
+            if counter["n"] != last_n:
+                last_n = counter["n"]
+                last_progress = time.time()
+            if stop_flag and stop_flag.is_set():
+                raise RuntimeError("已停止")
+            if time.time() - last_progress > 90:
+                raise RuntimeError("90 秒没有新片段下完（服务器假死），换线路重试")
+    except BaseException:
+        ex.shutdown(wait=False)
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise
+    ex.shutdown(wait=False)
+    try:
         if stop_flag and stop_flag.is_set():
             raise RuntimeError("已停止")
         ts_path = out_path + ".part.ts"
@@ -452,6 +473,7 @@ def _download_mp4_ffmpeg(api, item, out_dir, progress_cb=None, stop_flag=None, l
         tmp_path = out_path + ".part.mp4"
         err_path = tmp_path + ".log"
         cmd = [ffmpeg, "-y", "-loglevel", "error", "-nostats",
+               "-rw_timeout", "20000000",
                "-progress", "pipe:1", "-i", url, "-c", "copy", tmp_path]
         if log:
             log("开始下载%s：%s" % (("（线路%d）" % (idx + 1)) if idx else "", title))
