@@ -19,7 +19,7 @@ import time
 import urllib.parse
 import urllib.request
 
-VERSION = "v1.0.3"
+VERSION = "v1.0.4"
 APP_NAME = "爱液下载器"
 
 FALLBACK_HOSTS = [
@@ -611,7 +611,9 @@ def run_gui():
         load_async()
 
     tk.Button(top, text="搜索", width=8, command=do_search).pack(side="left")
-    ent.bind("<Return>", lambda e: do_search())
+    # 回车 = 搜索：在窗口任何地方按回车都触发搜索，不用去点按钮
+    root.bind_all("<Return>", lambda e: do_search())
+    ent.focus_set()
 
     # 中部：搜索结果列表（占满）
     mid = tk.Frame(root)
@@ -761,6 +763,7 @@ def run_gui():
         render_queue()
         log("已加入队列：%s（队列里 %d 个）" % (item.get("title") or "无标题", len(state["queue"])))
         ensure_worker()
+        ent.focus_set()
 
     add_btn.config(command=add_to_queue)
     lst.bind("<Double-Button-1>", lambda e: add_to_queue())
