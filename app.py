@@ -6,17 +6,20 @@
 只用 Python 标准库 + 随包的 ffmpeg.exe。
 """
 import base64
+import concurrent.futures
 import json
 import os
 import queue
 import re
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 import urllib.parse
 import urllib.request
 
-VERSION = "v1.0.1"
+VERSION = "v1.0.2"
 APP_NAME = "爱液下载器"
 
 FALLBACK_HOSTS = [
@@ -169,7 +172,253 @@ def fmt_duration(sec):
     return "%d:%02d" % (m, s)
 
 
+def _fetch_bytes(url, timeout=30, retries=3):
+    last = None
+    for i in range(retries):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.read()
+        except Exception as e:
+            last = e
+            time.sleep(1 + i)
+    raise last
+
+
+def _fetch_full(url, timeout=45, max_rounds=12):
+    """带断点续传的下载：这个分片服务器经常下到一半断线，
+    断了就用 Range 从断点接着下，已下的字节不浪费。"""
+    buf = bytearray()
+    total = None
+    for _round in range(max_rounds):
+        headers = {"User-Agent": UA}
+        if buf:
+            headers["Range"] = "bytes=%d-" % len(buf)
+        req = urllib.request.Request(url, headers=headers)
+        failed = False
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                if buf and r.status == 200:
+                    buf = bytearray()
+                cl = r.headers.get("Content-Length")
+                if cl is not None:
+                    total = (len(buf) + int(cl)) if r.status == 206 else int(cl)
+                while True:
+                    chunk = r.read(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+        except Exception:
+            failed = True
+        if total is not None and len(buf) >= total:
+            return bytes(buf[:total])
+        if not failed and total is None and buf:
+            return bytes(buf)
+        time.sleep(0.5)
+    if total is None and buf:
+        return bytes(buf)
+    raise _Incomplete(buf, total)
+
+
+class _Incomplete(Exception):
+    """分片实在下不全时带回已下到的部分字节。"""
+
+    def __init__(self, partial, total):
+        super().__init__("分片下载不完整（%d/%s 字节）" % (len(partial), total))
+        self.partial = bytes(partial)
+        self.total = total
+
+
+def _parse_attrs(s):
+    attrs = {}
+    for m in re.finditer(r'([A-Z0-9-]+)=("[^"]*"|[^,]*)', s):
+        v = m.group(2).strip()
+        if v.startswith('"'):
+            v = v[1:-1]
+        attrs[m.group(1)] = v
+    return attrs
+
+
+def _parse_m3u8(text, base_url):
+    segs = []
+    key_uri = None
+    key_iv = None
+    media_seq = 0
+    variant = None
+    pending_variant = False
+    for raw in text.splitlines():
+        l = raw.strip()
+        if l.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+            try:
+                media_seq = int(l.split(":", 1)[1])
+            except Exception:
+                pass
+        elif l.startswith("#EXT-X-KEY:"):
+            attrs = _parse_attrs(l.split(":", 1)[1])
+            if attrs.get("METHOD", "NONE") != "NONE":
+                if attrs.get("URI"):
+                    key_uri = urllib.parse.urljoin(base_url, attrs["URI"])
+                iv = attrs.get("IV", "")
+                if iv.lower().startswith("0x"):
+                    try:
+                        key_iv = bytes.fromhex(iv[2:].rjust(32, "0")[-32:])
+                    except Exception:
+                        key_iv = None
+        elif l.startswith("#EXT-X-STREAM-INF"):
+            pending_variant = True
+        elif l and not l.startswith("#"):
+            u = urllib.parse.urljoin(base_url, l)
+            if pending_variant:
+                variant = u
+                pending_variant = False
+            else:
+                segs.append(u)
+    return segs, key_uri, key_iv, media_seq, variant
+
+
+def _download_hls_parallel(m3u8_url, out_path, progress_cb=None, stop_flag=None):
+    """并行下载 HLS 分片：和列表走同一条网络（带系统代理），10 个分片同时下，
+    解密拼接后用 ffmpeg 在本地封装（不走网络）。"""
+    from Crypto.Cipher import AES  # pycryptodome，缺失时抛错由外层回退
+    text = _fetch_full(m3u8_url, timeout=20).decode("utf-8", "replace")
+    segs, key_uri, key_iv, media_seq, variant = _parse_m3u8(text, m3u8_url)
+    if variant and not segs:
+        text = _fetch_full(variant, timeout=20).decode("utf-8", "replace")
+        segs, key_uri, key_iv, media_seq, _v = _parse_m3u8(text, variant)
+    if not segs:
+        raise RuntimeError("播放列表里没有分片")
+    key = None
+    if key_uri:
+        key = _fetch_full(key_uri, timeout=20)
+        if len(key) not in (16, 24, 32):
+            raise RuntimeError("密钥长度不对")
+    total = len(segs)
+    tmpdir = tempfile.mkdtemp(prefix="aiye_dl_")
+    counter = {"n": 0, "bytes": 0}
+    lock = threading.Lock()
+
+    def one(idx, url):
+        if stop_flag and stop_flag.is_set():
+            raise RuntimeError("已停止")
+        complete = True
+        try:
+            data = _fetch_full(url, timeout=45)
+        except _Incomplete as e:
+            # 个别分片在服务器上本身就是残的：用下到的部分顶上，
+            # 播放时那几秒可能有点花，但整片能下完，不整单报废。
+            if not e.partial:
+                raise
+            data = e.partial
+            complete = False
+        if key is not None:
+            iv = key_iv if key_iv is not None else (media_seq + idx).to_bytes(16, "big")
+            if complete:
+                data = AES.new(key, AES.MODE_CBC, iv).decrypt(data)
+                if data:
+                    pad = data[-1]
+                    if 0 < pad <= 16:
+                        data = data[:-pad]
+            else:
+                n = len(data) - (len(data) % 16)
+                data = AES.new(key, AES.MODE_CBC, iv).decrypt(data[:n]) if n else b""
+        with open(os.path.join(tmpdir, "%06d.ts" % idx), "wb") as f:
+            f.write(data)
+        with lock:
+            counter["n"] += 1
+            counter["bytes"] += len(data)
+            if progress_cb:
+                progress_cb(min(99, int(counter["n"] * 100 / total)),
+                            counter["bytes"] / 1048576.0)
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+            futs = [ex.submit(one, i, u) for i, u in enumerate(segs)]
+            for fu in concurrent.futures.as_completed(futs):
+                fu.result()
+        if stop_flag and stop_flag.is_set():
+            raise RuntimeError("已停止")
+        ts_path = out_path + ".part.ts"
+        with open(ts_path, "wb") as out:
+            for i in range(total):
+                with open(os.path.join(tmpdir, "%06d.ts" % i), "rb") as f:
+                    while True:
+                        chunk = f.read(1024 * 512)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+        ffmpeg = find_ffmpeg()
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        err_path = ts_path + ".log"
+        with open(err_path, "wb") as ef:
+            rc = subprocess.call([ffmpeg, "-y", "-loglevel", "error", "-i", ts_path,
+                                  "-c", "copy", out_path],
+                                 stdout=subprocess.DEVNULL, stderr=ef,
+                                 creationflags=creationflags)
+        err = ""
+        try:
+            with open(err_path, "r", encoding="utf-8", errors="replace") as f:
+                err = f.read().strip()
+        except Exception:
+            pass
+        for p in (ts_path, err_path):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+        if rc != 0 or not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+            raise RuntimeError("封装失败：%s" % (err.splitlines()[-1] if err else "未知"))
+        if progress_cb:
+            progress_cb(100, 0.0)
+        return out_path
+    finally:
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def download_mp4(api, item, out_dir, progress_cb=None, stop_flag=None, log=None):
+    """先用并行引擎下；不行的线路再回退给 ffmpeg 直拉。成功返回文件路径。"""
+    vod_id = item["id"]
+    info = api.info(vod_id)
+    play_url = info.get("play_url") or ""
+    urls = []
+    if play_url:
+        urls.append(play_url)
+    for ln in api.lines(vod_id):
+        u = ln.get("domain") or ""
+        if u and u not in urls:
+            urls.append(u)
+    if not urls:
+        raise RuntimeError("没拿到播放地址（这个视频可能需要 VIP 解锁）")
+    title = sanitize_filename(info.get("title") or item.get("title"))
+    out_path = os.path.join(out_dir, title + ".mp4")
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+        out_path = os.path.join(out_dir, "%s_%s.mp4" % (title, vod_id))
+    last_err = None
+    for idx, url in enumerate(urls):
+        if log:
+            log("开始下载%s：%s" % (("（线路%d）" % (idx + 1)) if idx else "", title))
+        try:
+            return _download_hls_parallel(url, out_path, progress_cb, stop_flag)
+        except RuntimeError as e:
+            if str(e) == "已停止":
+                raise
+            last_err = str(e)
+        except Exception as e:
+            last_err = str(e)
+    if log:
+        log("并行下载没成功，换普通方式再试…")
+    try:
+        return _download_mp4_ffmpeg(api, item, out_dir, progress_cb, stop_flag, log)
+    except RuntimeError:
+        raise
+    except Exception:
+        raise RuntimeError("下载失败：%s" % (last_err or "未知错误"))
+
+
+def _download_mp4_ffmpeg(api, item, out_dir, progress_cb=None, stop_flag=None, log=None):
     """item: 列表里的一条（含 id/title/duration）。成功返回文件路径。"""
     vod_id = item["id"]
     info = api.info(vod_id)
@@ -209,9 +458,16 @@ def download_mp4(api, item, out_dir, progress_cb=None, stop_flag=None, log=None)
         try:
             err_f = open(err_path, "wb")
             try:
+                env = dict(os.environ)
+                try:
+                    for _k, _v in urllib.request.getproxies().items():
+                        if _v:
+                            env[_k + "_proxy"] = _v
+                except Exception:
+                    pass
                 proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err_f,
                                         text=True, encoding="utf-8", errors="replace",
-                                        creationflags=creationflags)
+                                        creationflags=creationflags, env=env)
                 while True:
                     line = proc.stdout.readline()
                     if not line:
@@ -296,11 +552,15 @@ def run_gui():
     }
     q = queue.Queue()
 
-    default_dir = os.path.join(os.path.expanduser("~"), "Downloads", "爱液下载")
+    if getattr(sys, "frozen", False):
+        app_dir = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        app_dir = os.path.dirname(os.path.abspath(__file__))
+    default_dir = os.path.join(app_dir, "下载")
     try:
         os.makedirs(default_dir, exist_ok=True)
     except Exception:
-        default_dir = os.path.expanduser("~")
+        default_dir = app_dir
     dir_var = tk.StringVar(value=default_dir)
     status_var = tk.StringVar(value="正在连接服务器…")
     page_var = tk.StringVar(value="第 1 页")
