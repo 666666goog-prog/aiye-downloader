@@ -16,7 +16,7 @@ import threading
 import urllib.parse
 import urllib.request
 
-VERSION = "v1.0.0"
+VERSION = "v1.0.1"
 APP_NAME = "爱液下载器"
 
 FALLBACK_HOSTS = [
@@ -195,42 +195,77 @@ def download_mp4(api, item, out_dir, progress_cb=None, stop_flag=None, log=None)
         duration = 0
 
     ffmpeg = find_ffmpeg()
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
     last_err = None
     for idx, url in enumerate(urls):
         tmp_path = out_path + ".part.mp4"
+        err_path = tmp_path + ".log"
         cmd = [ffmpeg, "-y", "-loglevel", "error", "-nostats",
                "-progress", "pipe:1", "-i", url, "-c", "copy", tmp_path]
         if log:
             log("开始下载%s：%s" % (("（线路%d）" % (idx + 1)) if idx else "", title))
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    text=True, encoding="utf-8", errors="replace")
-            while True:
-                line = proc.stdout.readline()
-                if not line:
-                    break
-                if stop_flag and stop_flag.is_set():
-                    proc.kill()
-                    raise RuntimeError("已停止")
-                if progress_cb and duration > 0 and line.startswith("out_time_us="):
-                    try:
-                        done = int(line.split("=", 1)[1].strip()) / 1000000.0
-                        progress_cb(min(99, int(done * 100 / duration)))
-                    except Exception:
-                        pass
-            err = proc.stderr.read() if proc.stderr else ""
-            rc = proc.wait()
+            err_f = open(err_path, "wb")
+            try:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err_f,
+                                        text=True, encoding="utf-8", errors="replace",
+                                        creationflags=creationflags)
+                while True:
+                    line = proc.stdout.readline()
+                    if not line:
+                        break
+                    if stop_flag and stop_flag.is_set():
+                        proc.kill()
+                        raise RuntimeError("已停止")
+                    if progress_cb and line.startswith("out_time"):
+                        pct = None
+                        try:
+                            if line.startswith("out_time_us="):
+                                done = int(line.split("=", 1)[1].strip()) / 1000000.0
+                                if duration > 0:
+                                    pct = min(99, int(done * 100 / duration))
+                            elif line.startswith("out_time="):
+                                t = line.split("=", 1)[1].strip()
+                                hh, mm, ss = t.split(":")
+                                done = int(hh) * 3600 + int(mm) * 60 + float(ss)
+                                if duration > 0:
+                                    pct = min(99, int(done * 100 / duration))
+                        except Exception:
+                            pct = None
+                        mb = 0.0
+                        try:
+                            if os.path.exists(tmp_path):
+                                mb = os.path.getsize(tmp_path) / 1048576.0
+                        except Exception:
+                            pass
+                        progress_cb(pct, mb)
+                rc = proc.wait()
+            finally:
+                err_f.close()
             if rc == 0 and os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
                 os.replace(tmp_path, out_path)
+                try:
+                    os.remove(err_path)
+                except Exception:
+                    pass
                 if progress_cb:
-                    progress_cb(100)
+                    progress_cb(100, 0.0)
                 return out_path
-            last_err = (err or "下载失败").strip().splitlines()[-1] if err else "下载失败"
+            err = ""
             try:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
+                with open(err_path, "r", encoding="utf-8", errors="replace") as f:
+                    err = f.read().strip()
             except Exception:
                 pass
+            last_err = err.splitlines()[-1] if err else "下载失败"
+            for p in (tmp_path, err_path):
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                except Exception:
+                    pass
         except RuntimeError:
             raise
         except Exception as e:
@@ -307,7 +342,7 @@ def run_gui():
                     items = state["api"].search(state["wd"], state["page"])
                 q.put(("items", items))
             except Exception as e:
-                q.put(("error", "加载失败：%s" % e))
+                q.put(("loaderror", "加载失败：%s（点一下分类或看最新可以重试）" % e))
         threading.Thread(target=work, daemon=True).start()
         log("正在加载…")
 
@@ -406,11 +441,13 @@ def run_gui():
         dl_btn.config(state="disabled")
         prog["value"] = 0
 
+        state["cur_title"] = item.get("title") or "视频"
+
         def work():
             try:
                 path = download_mp4(
                     state["api"], item, out_dir,
-                    progress_cb=lambda p: q.put(("progress", p)),
+                    progress_cb=lambda pct, mb: q.put(("progress", (pct, mb))),
                     stop_flag=state["stop"],
                     log=lambda m: q.put(("status", m)),
                 )
@@ -429,8 +466,16 @@ def run_gui():
                 kind, val = q.get_nowait()
                 if kind == "items":
                     set_items(val)
+                elif kind == "loaderror":
+                    log(val)
                 elif kind == "progress":
-                    prog["value"] = val
+                    pct, mb = val
+                    if pct is not None:
+                        prog["value"] = pct
+                    if mb and mb > 0:
+                        log("正在下载：%s（已下 %.1f MB%s）" % (
+                            state.get("cur_title", "视频"), mb,
+                            ("，%d%%" % pct) if pct is not None else ""))
                 elif kind == "status":
                     log(val)
                 elif kind == "done":
@@ -472,7 +517,7 @@ def run_gui():
     def connect():
         base = pick_working_host()
         if not base:
-            q.put(("error", "连不上它的服务器，检查一下网络再重开"))
+            q.put(("loaderror", "连不上它的服务器，检查一下网络再重新打开软件"))
             return
         state["api"] = Api(base)
         q.put(("ready", base))
