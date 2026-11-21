@@ -1,0 +1,31 @@
+name: build-windows
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+      - name: Download ffmpeg
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_pkg
+          $exe = Get-ChildItem -Recurse -Filter ffmpeg.exe ffmpeg_pkg | Select-Object -First 1
+          Copy-Item $exe.FullName .\ffmpeg.exe
+          .\ffmpeg.exe -version | Select-Object -First 1
+      - name: Build exe
+        run: pyinstaller --noconfirm --windowed --name AiyeDownloader --add-binary "ffmpeg.exe;." app.py
+      - name: Zip package
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist\AiyeDownloader -DestinationPath AiyeDownloader_Windows_X64_v1.0.0.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AiyeDownloader_Windows_X64_v1.0.0
+          path: AiyeDownloader_Windows_X64_v1.0.0.zip
