@@ -19,7 +19,7 @@ import time
 import urllib.parse
 import urllib.request
 
-VERSION = "v1.0.2"
+VERSION = "v1.0.3"
 APP_NAME = "爱液下载器"
 
 FALLBACK_HOSTS = [
@@ -537,17 +537,17 @@ def run_gui():
 
     root = tk.Tk()
     root.title("%s %s" % (APP_NAME, VERSION))
-    root.geometry("980x620")
-    root.minsize(860, 540)
+    root.geometry("980x700")
+    root.minsize(860, 620)
 
     state = {
         "api": None,
-        "mode": "latest",      # latest / type / search
-        "type_id": None,
         "wd": "",
         "page": 1,
         "items": [],
-        "downloading": False,
+        "queue": [],           # 下载队列：[{item, status}]
+        "worker_running": False,
+        "out_dir": "",
         "stop": threading.Event(),
     }
     q = queue.Queue()
@@ -589,63 +589,35 @@ def run_gui():
                 tail += "  播放 %s" % views
             lst.insert("end", (it.get("title") or "无标题") + tail)
         page_var.set("第 %d 页" % state["page"])
-        log("这一页有 %d 个视频，点一个再点下载" % len(items) if items else "这一页没有视频")
+        log("这一页有 %d 个视频，点一个再点「加入下载队列」" % len(items) if items else "这一页没有视频")
 
-    def load_async(kind):
+    def load_async():
         def work():
             try:
-                if kind == "latest":
-                    items = state["api"].latest(state["page"])
-                elif kind == "type":
-                    items = state["api"].by_type(state["type_id"], state["page"])
-                else:
-                    items = state["api"].search(state["wd"], state["page"])
+                items = state["api"].search(state["wd"], state["page"])
                 q.put(("items", items))
             except Exception as e:
-                q.put(("loaderror", "加载失败：%s（点一下分类或看最新可以重试）" % e))
+                q.put(("loaderror", "加载失败：%s（再点一次搜索重试）" % e))
         threading.Thread(target=work, daemon=True).start()
-        log("正在加载…")
+        log("正在搜索…")
 
     def do_search():
         wd = search_var.get().strip()
         if not wd:
             messagebox.showinfo("提示", "先输入要搜的标题或番号")
             return
-        state["mode"] = "search"
         state["wd"] = wd
         state["page"] = 1
-        load_async("search")
+        load_async()
 
     tk.Button(top, text="搜索", width=8, command=do_search).pack(side="left")
-    tk.Button(top, text="看最新", width=8, command=lambda: (state.update(mode="latest", page=1), load_async("latest"))[1]).pack(side="left", padx=6)
     ent.bind("<Return>", lambda e: do_search())
 
-    # 中部：左分类 + 右列表
+    # 中部：搜索结果列表（占满）
     mid = tk.Frame(root)
     mid.pack(fill="both", expand=True, padx=10, pady=4)
-    tk.Label(mid, text="分类（点一下）").pack(side="top", anchor="w")
-    left = tk.Frame(mid)
-    left.pack(side="left", fill="y")
-    cat_list = tk.Listbox(left, width=22, exportselection=False)
-    cat_list.pack(side="left", fill="y")
-    cat_ids = []
-
-    right = tk.Frame(mid)
-    right.pack(side="left", fill="both", expand=True, padx=(10, 0))
-    lst = tk.Listbox(right, exportselection=False)
+    lst = tk.Listbox(mid, exportselection=False)
     lst.pack(fill="both", expand=True)
-
-    def on_cat(_e=None):
-        sel = cat_list.curselection()
-        if not sel:
-            return
-        tid = cat_ids[sel[0]]
-        state["mode"] = "type"
-        state["type_id"] = tid
-        state["page"] = 1
-        load_async("type")
-
-    cat_list.bind("<<ListboxSelect>>", on_cat)
 
     # 翻页 + 下载
     bar = tk.Frame(root)
@@ -655,15 +627,17 @@ def run_gui():
     tk.Button(bar, text="下一页", width=8, command=lambda: turn_page(1)).pack(side="left")
 
     def turn_page(delta):
+        if not state["wd"]:
+            return
         np = state["page"] + delta
         if np < 1:
             return
         state["page"] = np
-        load_async(state["mode"])
+        load_async()
 
-    dl_btn = tk.Button(bar, text="下载选中视频", width=14, bg="#2e7d32", fg="white")
-    dl_btn.pack(side="right")
-    stop_btn = tk.Button(bar, text="停止", width=8, command=lambda: state["stop"].set())
+    add_btn = tk.Button(bar, text="加入下载队列", width=14, bg="#2e7d32", fg="white")
+    add_btn.pack(side="right")
+    stop_btn = tk.Button(bar, text="停止当前", width=8, command=lambda: state["stop"].set())
     stop_btn.pack(side="right", padx=6)
 
     # 保存位置 + 进度 + 状态
@@ -676,49 +650,120 @@ def run_gui():
         d = filedialog.askdirectory(initialdir=dir_var.get())
         if d:
             dir_var.set(d)
+            state["out_dir"] = d
 
     tk.Button(bot, text="换文件夹", width=10, command=choose_dir).pack(side="left")
     prog = ttk.Progressbar(root, maximum=100)
     prog.pack(fill="x", padx=10)
     tk.Label(root, textvariable=status_var, anchor="w", fg="#444").pack(fill="x", padx=10, pady=(2, 8))
 
-    def do_download():
-        if state["downloading"]:
+    # 下载队列：从上往下一个一个下
+    qframe = tk.LabelFrame(root, text="下载队列（从上往下，一个一个下）")
+    qframe.pack(fill="x", padx=10, pady=(0, 8))
+    qlist = tk.Listbox(qframe, height=6, exportselection=False)
+    qlist.pack(side="left", fill="both", expand=True)
+    qbtns = tk.Frame(qframe)
+    qbtns.pack(side="right", fill="y", padx=4)
+
+    def remove_from_queue():
+        sel = qlist.curselection()
+        if not sel:
+            messagebox.showinfo("提示", "先在队列里点一个")
             return
+        e = state["queue"][sel[0]]
+        if e["status"].startswith("下载中"):
+            log("这个正在下载，要停就点「停止当前」")
+            return
+        del state["queue"][sel[0]]
+        render_queue()
+        log("已从队列移除：%s" % (e["item"].get("title") or "无标题"))
+
+    def clear_done():
+        state["queue"] = [e for e in state["queue"]
+                           if not (e["status"].startswith("已完成") or e["status"].startswith("失败"))]
+        render_queue()
+
+    tk.Button(qbtns, text="从队列移除", width=10, command=remove_from_queue).pack(pady=2)
+    tk.Button(qbtns, text="清掉已完成", width=10, command=clear_done).pack(pady=2)
+
+    def render_queue():
+        sel = qlist.curselection()
+        qlist.delete(0, "end")
+        for e in state["queue"]:
+            qlist.insert("end", "%s  ——  %s" % (e["item"].get("title") or "无标题", e["status"]))
+        if sel and sel[0] < len(state["queue"]):
+            qlist.selection_set(sel[0])
+
+    def queue_worker():
+        try:
+            while True:
+                nxt = None
+                for e in state["queue"]:
+                    if e["status"] == "等下载":
+                        nxt = e
+                        break
+                if nxt is None:
+                    break
+                e = nxt
+                e["status"] = "下载中"
+                q.put(("queue", None))
+                out_dir = state["out_dir"] or default_dir
+                try:
+                    os.makedirs(out_dir, exist_ok=True)
+                except Exception:
+                    pass
+                state["stop"].clear()
+                state["cur_title"] = e["item"].get("title") or "视频"
+                last_pct = [-1]
+
+                def cb(pct, mb, e=e, last_pct=last_pct):
+                    q.put(("progress", (pct, mb)))
+                    if pct is not None and pct // 10 != last_pct[0] // 10:
+                        last_pct[0] = pct
+                        e["status"] = "下载中 %d%%" % pct
+                        q.put(("queue", None))
+
+                try:
+                    download_mp4(
+                        state["api"], e["item"], out_dir,
+                        progress_cb=cb,
+                        stop_flag=state["stop"],
+                        log=lambda m: q.put(("status", m)),
+                    )
+                    e["status"] = "已完成"
+                except Exception as ex:
+                    msg = str(ex)
+                    e["status"] = "已停止" if msg == "已停止" else ("失败：" + msg[:50])
+                q.put(("queue", None))
+                q.put(("progress", (0, 0)))
+        finally:
+            state["worker_running"] = False
+            q.put(("queue_done", None))
+
+    def ensure_worker():
+        if not state["worker_running"]:
+            state["worker_running"] = True
+            threading.Thread(target=queue_worker, daemon=True).start()
+
+    def add_to_queue():
         sel = lst.curselection()
         if not sel:
             messagebox.showinfo("提示", "先在列表里点一个视频")
             return
         item = state["items"][sel[0]]
-        out_dir = dir_var.get().strip() or default_dir
-        try:
-            os.makedirs(out_dir, exist_ok=True)
-        except Exception as e:
-            messagebox.showerror("出错", "文件夹建不了：%s" % e)
-            return
-        state["downloading"] = True
-        state["stop"].clear()
-        dl_btn.config(state="disabled")
-        prog["value"] = 0
+        for e in state["queue"]:
+            if e["item"]["id"] == item["id"] and (
+                    e["status"] == "等下载" or e["status"].startswith("下载中")):
+                log("这个已经在队列里了：%s" % (item.get("title") or "无标题"))
+                return
+        state["out_dir"] = dir_var.get().strip() or default_dir
+        state["queue"].append({"item": item, "status": "等下载"})
+        render_queue()
+        log("已加入队列：%s（队列里 %d 个）" % (item.get("title") or "无标题", len(state["queue"])))
+        ensure_worker()
 
-        state["cur_title"] = item.get("title") or "视频"
-
-        def work():
-            try:
-                path = download_mp4(
-                    state["api"], item, out_dir,
-                    progress_cb=lambda pct, mb: q.put(("progress", (pct, mb))),
-                    stop_flag=state["stop"],
-                    log=lambda m: q.put(("status", m)),
-                )
-                q.put(("done", path))
-            except Exception as e:
-                q.put(("error", str(e)))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    dl_btn.config(command=do_download)
-    lst.bind("<Double-Button-1>", lambda e: do_download())
+    add_btn.config(command=add_to_queue)
+    lst.bind("<Double-Button-1>", lambda e: add_to_queue())
 
     def poll():
         try:
@@ -738,38 +783,15 @@ def run_gui():
                             ("，%d%%" % pct) if pct is not None else ""))
                 elif kind == "status":
                     log(val)
-                elif kind == "done":
-                    state["downloading"] = False
-                    dl_btn.config(state="normal")
-                    prog["value"] = 100
-                    log("下载完成：%s" % val)
-                    messagebox.showinfo("完成", "已存好：\n%s" % val)
-                elif kind == "error":
-                    state["downloading"] = False
-                    dl_btn.config(state="normal")
-                    log("出错：" + val)
-                    messagebox.showerror("出错", val)
+                elif kind == "queue":
+                    render_queue()
+                elif kind == "queue_done":
+                    done_n = sum(1 for e in state["queue"] if e["status"] == "已完成")
+                    if done_n:
+                        log("队列下完了：共完成 %d 个，都在下载文件夹里" % done_n)
+                    prog["value"] = 0
                 elif kind == "ready":
-                    log("已连上服务器，点分类或直接点视频下载")
-                    load_async("latest")
-                    # 填分类
-                    def fill_cats():
-                        try:
-                            cats = state["api"].types()
-                            pairs = []
-                            for parent in cats:
-                                for child in (parent.get("child") or []):
-                                    pairs.append(("%s" % child.get("name"), child.get("id")))
-                            q.put(("cats", pairs))
-                        except Exception:
-                            pass
-                    threading.Thread(target=fill_cats, daemon=True).start()
-                elif kind == "cats":
-                    cat_list.delete(0, "end")
-                    cat_ids.clear()
-                    for name, cid in val:
-                        cat_list.insert("end", name)
-                        cat_ids.append(cid)
+                    log("已连上服务器，在上面输入标题或番号，点搜索")
         except queue.Empty:
             pass
         root.after(120, poll)
