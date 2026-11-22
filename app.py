@@ -19,7 +19,7 @@ import time
 import urllib.parse
 import urllib.request
 
-VERSION = "v1.0.7"
+VERSION = "v1.0.8"
 APP_NAME = "爱液下载器"
 
 FALLBACK_HOSTS = [
@@ -553,6 +553,21 @@ def _download_mp4_ffmpeg(api, item, out_dir, progress_cb=None, stop_flag=None, l
 
 # ---------------- 界面 ----------------
 
+def exact_terms(wd):
+    """把搜索词按空格/标点拆成几段；标题必须每段都含，才算精确命中。"""
+    if not wd:
+        return []
+    return [p for p in re.split(r"[\s,，、;；/／]+", wd.strip()) if p]
+
+
+def title_matches_exact(title, wd):
+    terms = exact_terms(wd)
+    if not terms:
+        return True
+    t = (title or "").lower()
+    return all(term.lower() in t for term in terms)
+
+
 def _load_json_file(path):
     try:
         with open(path, encoding="utf-8") as f:
@@ -649,8 +664,16 @@ def run_gui():
     def load_async():
         def work():
             try:
-                items = state["api"].search(state["wd"], state["page"])
+                raw = state["api"].search(state["wd"], state["page"])
+                items = raw
+                if state["wd"]:
+                    # 精确搜索：服务器是模糊匹配，这里再筛一遍，只留标题含全部关键词的
+                    items = [it for it in raw if title_matches_exact(it.get("title"), state["wd"])]
                 q.put(("items", items))
+                if state["wd"] and raw and not items:
+                    q.put(("status", "这一页的结果都没同时含全部关键词，已过滤掉，点下一页看看"))
+                elif state["wd"] and len(items) < len(raw):
+                    q.put(("status", "精确搜索：这一页 %d 个里只留了 %d 个（标题含全部关键词的）" % (len(raw), len(items))))
             except Exception as e:
                 q.put(("loaderror", "加载失败：%s（再点一次搜索重试）" % e))
         threading.Thread(target=work, daemon=True).start()
