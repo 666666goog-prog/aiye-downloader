@@ -24,8 +24,8 @@ jobs:
       - name: Zip package
         shell: pwsh
         run: |
-          Compress-Archive -Path dist\AiyeDownloader -DestinationPath AiyeDownloader_Windows_X64_v1.0.6.zip
+          Compress-Archive -Path dist\AiyeDownloader -DestinationPath AiyeDownloader_Windows_X64_v1.0.7.zip
       - uses: actions/upload-artifact@v4
         with:
-          name: AiyeDownloader_Windows_X64_v1.0.6
-          path: AiyeDownloader_Windows_X64_v1.0.6.zip
+          name: AiyeDownloader_Windows_X64_v1.0.7
+          path: AiyeDownloader_Windows_X64_v1.0.7.zip
