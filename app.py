@@ -19,7 +19,7 @@ import time
 import urllib.parse
 import urllib.request
 
-VERSION = "v1.0.6"
+VERSION = "v1.0.7"
 APP_NAME = "爱液下载器"
 
 FALLBACK_HOSTS = [
@@ -553,6 +553,23 @@ def _download_mp4_ffmpeg(api, item, out_dir, progress_cb=None, stop_flag=None, l
 
 # ---------------- 界面 ----------------
 
+def _load_json_file(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_json_file(path, data):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
 def run_gui():
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
@@ -584,6 +601,22 @@ def run_gui():
     except Exception:
         default_dir = app_dir
     dir_var = tk.StringVar(value=default_dir)
+    # 已下载记录（按视频ID记账，文件搬到哪都认得出）+ 设置（旧文件夹/跳过开关）
+    history_path = os.path.join(app_dir, "download_history.json")
+    settings_path = os.path.join(app_dir, "aiye_settings.json")
+    history = _load_json_file(history_path)
+    settings = _load_json_file(settings_path)
+    archive_var = tk.StringVar(value=settings.get("archive_dir") or "")
+    skip_var = tk.BooleanVar(value=bool(settings.get("skip", True)))
+    state["archive_dir"] = archive_var.get().strip()
+    state["skip_existing"] = bool(skip_var.get())
+
+    def save_settings():
+        settings["archive_dir"] = archive_var.get().strip()
+        settings["skip"] = bool(skip_var.get())
+        _save_json_file(settings_path, settings)
+        state["archive_dir"] = settings["archive_dir"]
+        state["skip_existing"] = settings["skip"]
     status_var = tk.StringVar(value="正在连接服务器…")
     page_var = tk.StringVar(value="第 1 页")
 
@@ -699,6 +732,25 @@ def run_gui():
             state["out_dir"] = d
 
     tk.Button(bot, text="换文件夹", width=10, command=choose_dir).pack(side="left")
+
+    # 旧文件位置 + 跳过已下载开关：以前下好的文件搬走后，指给软件看，它就不会重复下
+    bot2 = tk.Frame(root)
+    bot2.pack(fill="x", padx=10, pady=(0, 6))
+    tk.Label(bot2, text="旧文件在：").pack(side="left")
+    arch_entry = tk.Entry(bot2, textvariable=archive_var, width=40)
+    arch_entry.pack(side="left", padx=(0, 6))
+    add_edit_menu(arch_entry)
+
+    def choose_archive():
+        d = filedialog.askdirectory(initialdir=archive_var.get() or default_dir)
+        if d:
+            archive_var.set(d)
+            save_settings()
+            log("已记住旧文件位置：%s" % d)
+
+    tk.Button(bot2, text="选文件夹", width=10, command=choose_archive).pack(side="left")
+    tk.Checkbutton(bot2, text="跳过已下载的", variable=skip_var,
+                   command=save_settings).pack(side="left", padx=(10, 0))
     prog = ttk.Progressbar(root, maximum=100)
     prog.pack(fill="x", padx=10)
     tk.Label(root, textvariable=status_var, anchor="w", fg="#444").pack(fill="x", padx=10, pady=(2, 8))
@@ -726,7 +778,8 @@ def run_gui():
 
     def clear_done():
         state["queue"] = [e for e in state["queue"]
-                           if not (e["status"].startswith("已完成") or e["status"].startswith("失败"))]
+                           if not (e["status"].startswith("已完成") or e["status"].startswith("失败")
+                                   or e["status"].startswith("已下载过") or e["status"].startswith("该文件已存在"))]
         render_queue()
 
     tk.Button(qbtns, text="从队列移除", width=10, command=remove_from_queue).pack(pady=2)
@@ -739,6 +792,25 @@ def run_gui():
             qlist.insert("end", "%s  ——  %s" % (e["item"].get("title") or "无标题", e["status"]))
         if sel and sel[0] < len(state["queue"]):
             qlist.selection_set(sel[0])
+
+    def find_existing(item, out_dir):
+        """这个视频下过没有：先查记录（按编号，搬到哪都认），再按文件名查下载夹和旧文件夹。
+        下过返回一句话说明，没下过返回 None。"""
+        if str(item.get("id")) in history:
+            return "已下载过"
+        title = sanitize_filename(item.get("title"))
+        names = [title + ".mp4", "%s_%s.mp4" % (title, item.get("id"))]
+        for d in (out_dir, state.get("archive_dir") or ""):
+            if not d:
+                continue
+            for nm in names:
+                p = os.path.join(d, nm)
+                try:
+                    if os.path.exists(p) and os.path.getsize(p) > 0:
+                        return "该文件已存在"
+                except Exception:
+                    pass
+        return None
 
     def queue_worker():
         try:
@@ -758,6 +830,13 @@ def run_gui():
                     os.makedirs(out_dir, exist_ok=True)
                 except Exception:
                     pass
+                if state.get("skip_existing", True):
+                    reason = find_existing(e["item"], out_dir)
+                    if reason:
+                        e["status"] = reason + "，跳过"
+                        q.put(("queue", None))
+                        q.put(("status", "跳过：%s（%s）" % (e["item"].get("title") or "无标题", reason)))
+                        continue
                 state["cur_title"] = e["item"].get("title") or "视频"
                 attempt = 0
                 while True:
@@ -774,12 +853,18 @@ def run_gui():
                             q.put(("queue", None))
 
                     try:
-                        download_mp4(
+                        saved_path = download_mp4(
                             state["api"], e["item"], out_dir,
                             progress_cb=cb,
                             stop_flag=state["stop"],
                             log=lambda m: q.put(("status", m)),
                         )
+                        history[str(e["item"]["id"])] = {
+                            "title": e["item"].get("title") or "",
+                            "file": os.path.basename(saved_path),
+                            "time": time.strftime("%Y-%m-%d %H:%M"),
+                        }
+                        _save_json_file(history_path, history)
                         e["status"] = "已完成"
                         break
                     except Exception as ex:
@@ -830,8 +915,16 @@ def run_gui():
                 log("这个已经在队列里了：%s" % (item.get("title") or "无标题"))
                 return
         state["out_dir"] = dir_var.get().strip() or default_dir
+        save_settings()
         state["queue"].append({"item": item, "status": "等下载"})
         render_queue()
+        if state.get("skip_existing", True):
+            reason = find_existing(item, state["out_dir"])
+            if reason:
+                log("已加入队列：%s（%s，到时候会自动跳过）" % (item.get("title") or "无标题", reason))
+                ensure_worker()
+                ent.focus_set()
+                return
         log("已加入队列：%s（队列里 %d 个）" % (item.get("title") or "无标题", len(state["queue"])))
         ensure_worker()
         ent.focus_set()
