@@ -19,7 +19,7 @@ import time
 import urllib.parse
 import urllib.request
 
-VERSION = "v1.0.8"
+VERSION = "v1.0.9"
 APP_NAME = "爱液下载器"
 
 FALLBACK_HOSTS = [
@@ -119,6 +119,18 @@ class Api:
     def search(self, wd, page=1, limit=20):
         data = self._get("/api/vod/clever", {"wd": wd, "page": page, "limit": limit})
         return data.get("list") or []
+
+    def search_page(self, wd, page=1, limit=20):
+        data = self._get("/api/vod/clever", {"wd": wd, "page": page, "limit": limit})
+        return data.get("list") or [], int(data.get("total") or 0)
+
+    def search_total(self, wd):
+        """只问服务器这个词有多少条结果（limit=1）；服务器报错（如超15字）返回 -1。"""
+        try:
+            data = self._get("/api/vod/clever", {"wd": wd, "page": 1, "limit": 1})
+            return int(data.get("total") or 0)
+        except Exception:
+            return -1
 
     def types(self):
         data = self._get("/api/vod/type")
@@ -568,6 +580,42 @@ def title_matches_exact(title, wd):
     return all(term.lower() in t for term in terms)
 
 
+def probe_candidates(wd):
+    """生成给服务器的「探路词」：必须都是原搜索词的子串（标题含原词就必含子串），
+    每个不超过 15 字（服务器上限，超了直接报错）。
+    为什么需要：服务器搜索只认开头那一截——搜「的口味」它按「的」算，能配出全站
+    三万多条，目标早被埋没了。先拿几个子串各问一次条数，挑结果最少的那个去
+    一页页扫回来，再在本地按原词精确筛，尾巴上的词才搜得到。"""
+    wd = (wd or "").strip()
+    cands = []
+
+    def add(s):
+        s = (s or "").strip()
+        if s and len(s) >= 2:
+            s = s[:15]
+            if s not in cands:
+                cands.append(s)
+
+    if len(wd) <= 15:
+        add(wd)
+    terms = exact_terms(wd)
+    for t in terms:
+        if len(t) <= 15:
+            add(t)
+        else:
+            add(t[:15])
+            add(t[-15:])
+    if terms:
+        t = max(terms, key=len)
+        if len(t) >= 3:
+            add(t[1:])
+            add(t[-3:])
+            add(t[-2:])
+    if not cands and wd:
+        cands.append(wd[:15])
+    return cands[:8]
+
+
 def _load_json_file(path):
     try:
         with open(path, encoding="utf-8") as f:
@@ -598,6 +646,9 @@ def run_gui():
         "api": None,
         "wd": "",
         "page": 1,
+        "scan": None,          # 搜索扫描状态：{probe,total,next_page,scanned,matches,seen,exhausted}
+        "shown": 0,            # 当前显示的是 matches 里第几条起的一批
+        "searching": False,
         "items": [],
         "queue": [],           # 下载队列：[{item, status}]
         "worker_running": False,
@@ -661,32 +712,109 @@ def run_gui():
         page_var.set("第 %d 页" % state["page"])
         log("这一页有 %d 个视频，点一个再点「加入下载队列」" % len(items) if items else "这一页没有视频")
 
-    def load_async():
-        def work():
-            try:
-                raw = state["api"].search(state["wd"], state["page"])
-                items = raw
-                if state["wd"]:
-                    # 精确搜索：服务器是模糊匹配，这里再筛一遍，只留标题含全部关键词的
-                    items = [it for it in raw if title_matches_exact(it.get("title"), state["wd"])]
-                q.put(("items", items))
-                if state["wd"] and raw and not items:
-                    q.put(("status", "这一页的结果都没同时含全部关键词，已过滤掉，点下一页看看"))
-                elif state["wd"] and len(items) < len(raw):
-                    q.put(("status", "精确搜索：这一页 %d 个里只留了 %d 个（标题含全部关键词的）" % (len(raw), len(items))))
-            except Exception as e:
-                q.put(("loaderror", "加载失败：%s（再点一次搜索重试）" % e))
-        threading.Thread(target=work, daemon=True).start()
-        log("正在搜索…")
+    PAGE_N = 20        # 一屏显示几个
+    SCAN_CAP = 500     # 一次最多扫多少条服务器结果（防常见词把全站翻一遍）
+
+    def show_matches():
+        sc = state["scan"]
+        if not sc:
+            return
+        batch = sc["matches"][state["shown"]:state["shown"] + PAGE_N]
+        state["page"] = state["shown"] // PAGE_N + 1
+        set_items(batch)
+
+    def scan_worker(need):
+        """后台线程：先给几个探路词（原词的子串）各问一次条数，从结果最少的开始，
+        一个不行换下一个，逐页扫回来在本地按原词精确筛，直到攒够 need 个。
+        为什么要多个探路词轮着来：服务器给的结果不靠谱——比如搜 TART-607 它
+        只给 1 条还给错了，真正的 START-607 得靠探路词 START-607 才找得到。"""
+        sc = state["scan"]
+        api = state["api"]
+        try:
+            if sc["probes"] is None:
+                q.put(("status", "正在找最准的搜法…"))
+                probes = []
+                for cand in probe_candidates(state["wd"]):
+                    tot = api.search_total(cand)
+                    if tot > 0:
+                        probes.append({"wd": cand, "total": tot, "next_page": 1,
+                                       "scanned": 0, "got": False, "done": False})
+                probes.sort(key=lambda p: (p["total"], -len(p["wd"])))
+                sc["probes"] = probes
+                if not probes:
+                    sc["exhausted"] = True
+            for p in sc["probes"]:
+                if len(sc["matches"]) >= need or sc["exhausted"]:
+                    break
+                if p["done"]:
+                    continue
+                empty_streak = 0
+                while True:
+                    items, tot = api.search_page(p["wd"], p["next_page"])
+                    if tot:
+                        p["total"] = tot
+                    p["next_page"] += 1
+                    p["scanned"] += len(items)
+                    sc["scanned"] += len(items)
+                    new_hit = False
+                    for it in items:
+                        vid = str(it.get("id"))
+                        if vid in sc["seen"]:
+                            continue
+                        sc["seen"].add(vid)
+                        if title_matches_exact(it.get("title"), state["wd"]):
+                            sc["matches"].append(it)
+                            new_hit = True
+                    if new_hit:
+                        p["got"] = True
+                        empty_streak = 0
+                    else:
+                        empty_streak += 1
+                    q.put(("status", "正在一页页帮你找：已扫 %d 条，找到 %d 个"
+                           % (sc["scanned"], len(sc["matches"]))))
+                    if len(sc["matches"]) >= need:
+                        break
+                    if len(items) < PAGE_N or p["scanned"] >= p["total"]:
+                        p["done"] = True
+                        break
+                    if p["got"] and empty_streak >= 4 and p["scanned"] >= 60:
+                        p["done"] = True   # 命中都在前面，后面连着 4 页没有，不深挖了
+                        break
+                    if not p["got"] and p["scanned"] >= 200:
+                        p["done"] = True   # 这个词太泛，扫 200 条一个没中，换下一个
+                        break
+                    if p["scanned"] >= SCAN_CAP or sc["scanned"] >= 800:
+                        p["done"] = True
+                        sc["capped"] = True
+                        break
+                # 小结果集已经扫完还命中了：基本就是全集，不用再试更泛的词
+                if p["got"] and p["done"] and p["scanned"] >= p["total"] and p["total"] <= 60:
+                    sc["exhausted"] = True
+                if sc["capped"]:
+                    sc["exhausted"] = True
+            if sc["probes"] and all(p["done"] for p in sc["probes"]):
+                sc["exhausted"] = True
+            q.put(("scan_done", None))
+        except Exception as e:
+            q.put(("loaderror", "搜索失败：%s（再点一次搜索重试）" % e))
+        finally:
+            state["searching"] = False
 
     def do_search():
         wd = search_var.get().strip()
         if not wd:
             messagebox.showinfo("提示", "先输入要搜的标题或番号")
             return
+        if state["searching"]:
+            return
         state["wd"] = wd
         state["page"] = 1
-        load_async()
+        state["shown"] = 0
+        state["scan"] = {"probes": None, "scanned": 0, "matches": [], "seen": set(),
+                         "exhausted": False, "capped": False}
+        state["searching"] = True
+        threading.Thread(target=lambda: scan_worker(PAGE_N), daemon=True).start()
+        log("正在搜索…")
 
     tk.Button(top, text="搜索", width=8, command=do_search).pack(side="left")
     # 回车 = 搜索：在窗口任何地方按回车都触发搜索，不用去点按钮
@@ -727,13 +855,28 @@ def run_gui():
     tk.Button(bar, text="下一页", width=8, command=lambda: turn_page(1)).pack(side="left")
 
     def turn_page(delta):
-        if not state["wd"]:
+        sc = state["scan"]
+        if not sc:
             return
-        np = state["page"] + delta
-        if np < 1:
+        if delta < 0:
+            if state["shown"] >= PAGE_N:
+                state["shown"] -= PAGE_N
+                show_matches()
             return
-        state["page"] = np
-        load_async()
+        if state["shown"] + PAGE_N < len(sc["matches"]):
+            state["shown"] += PAGE_N
+            show_matches()
+            return
+        if sc["exhausted"]:
+            log("已经到底了，共找到 %d 个" % len(sc["matches"]))
+            return
+        if state["searching"]:
+            return
+        state["shown"] += PAGE_N
+        state["searching"] = True
+        threading.Thread(target=lambda: scan_worker(state["shown"] + PAGE_N),
+                         daemon=True).start()
+        log("正在接着往下找…")
 
     add_btn = tk.Button(bar, text="加入下载队列", width=14, bg="#2e7d32", fg="white")
     add_btn.pack(side="right")
@@ -961,6 +1104,26 @@ def run_gui():
                 kind, val = q.get_nowait()
                 if kind == "items":
                     set_items(val)
+                elif kind == "scan_done":
+                    sc = state["scan"]
+                    if sc:
+                        if sc["matches"] and state["shown"] >= len(sc["matches"]):
+                            state["shown"] = (len(sc["matches"]) - 1) // PAGE_N * PAGE_N
+                        show_matches()
+                        if not sc["matches"]:
+                            if sc["capped"]:
+                                log("这个词太常见了，翻了 %d 条还没找到，换个更具体的词试试"
+                                    % sc["scanned"])
+                            else:
+                                log("没找到标题里含「%s」的视频，换个词试试" % state["wd"])
+                        elif sc["capped"]:
+                            log("找到 %d 个（标题含全部关键词），这个词结果太多没全翻完，先看这些"
+                                % len(sc["matches"]))
+                        elif sc["exhausted"]:
+                            log("找到 %d 个（标题含全部关键词），全找完了" % len(sc["matches"]))
+                        else:
+                            log("找到 %d 个（标题含全部关键词），点下一页接着找"
+                                % len(sc["matches"]))
                 elif kind == "loaderror":
                     log(val)
                 elif kind == "progress":
